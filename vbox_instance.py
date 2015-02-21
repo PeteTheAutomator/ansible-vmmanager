@@ -20,6 +20,12 @@ options:
     description:
       - name for the target VM
     required: true
+  network_type:
+    description:
+      - networking type
+    required: false
+    default: bridged
+    choices: ['bridged','nat','hostonly']
   state:
     description:
       - create or terminate instances
@@ -31,15 +37,45 @@ options:
 EXAMPLES = '''
 # Create a clone image called web01.localdomain from a source image called base-image-centos6
 - vbox_instance: source_image='base-image-centos6' target_image='web01.localdomain'
+
+# Complete playbook to provision a couple of VMs, set their hostname and install httpd...
+- hosts: localhost
+  connection: local
+  gather_facts: False
+  tasks:
+
+    - name: provision instance
+      vbox_instance: source_image=packer-virtualbox-base-centos7-1424513286 target_image={{ item }} state=running network_type=bridged
+      register: instance_result
+      with_items:
+        - web01.localdomain
+        - web02.localdomain
+
+    - name: Add instance results to host group
+      add_host: hostname={{ item.ansible_facts.ipaddress }} groupname=vbox_hosts hostname_to_set={{ item.item }}
+      with_items: instance_result.results
+
+- hosts: vbox_hosts
+  remote_user: vagrant
+  sudo: yes
+
+  pre_tasks:
+    - name: set hostname
+      hostname: name={{ hostname_to_set }}
+
+  tasks:
+    - name: install httpd
+      yum: name=httpd state=installed
 '''
 
 
 class VBox():
-    def __init__(self, module, vboxmanage, source_image, target_image, state):
+    def __init__(self, module, vboxmanage, source_image, target_image, network_type, state):
         self.module = module
         self.vboxmanage = vboxmanage
         self.source_image = source_image
         self.target_image = target_image
+        self.network_type = network_type
         self.state = state
 
     @staticmethod
@@ -80,7 +116,7 @@ class VBox():
                     sleep(1)
                     tries += 1
                 elif ipregex.match(ipstdout):
-                    return ipregex.search(ipstdout).group().replace('\n', '')
+                    return ipregex.search(ipstdout).groups()[0]
                 else:
                     self.module.fail_json(msg='Error: unexpected stdout while trying to determine VM ip address')
         self.module.fail_json(msg='Timeout exceeded while trying to get VM ip address')
@@ -121,9 +157,23 @@ class VBox():
         if p.returncode != 0:
             self.module.fail_json(msg='Failed to clone VM')
 
+    def set_network_type(self):
+        p = self.exec_command(self.vboxmanage + ' modifyvm ' + self.target_image + ' --nic1 ' + self.network_type)
+        if p.returncode != 0:
+            self.module.fail_json(msg='Error setting network type')
+        if self.network_type == 'hostonly':
+            p = self.exec_command(self.vboxmanage + ' modifyvm ' + self.target_image + ' --hostonlyadapter1 "vboxnet0"')
+            if p.returncode != 0:
+                self.module.fail_json(msg='Error setting bridge adapter')
+        elif self.network_type == 'bridged':
+            p = self.exec_command(self.vboxmanage + ' modifyvm ' + self.target_image + ' --bridgeadapter1 "en0: Wi-Fi (AirPort)"')
+            if p.returncode != 0:
+                self.module.fail_json(msg='Error setting hostonly adapter')
+
     def start_vm(self):
         if self.target_image not in self.get_vms():
             self.clone_vm()
+            self.set_network_type()
         p = self.exec_command(self.vboxmanage + ' startvm ' + self.target_image + ' --type gui')
         if p.returncode != 0 or self.is_running is False:
             self.module.fail_json(msg='Error trying to start VM')
@@ -148,6 +198,7 @@ def main():
             vboxmanage=dict(default='/usr/bin/VBoxManage'),
             source_image=dict(required=True),
             target_image=dict(required=True),
+            network_type=dict(default='bridged'),
             state=dict(default='running'),
         )
     )
@@ -155,25 +206,24 @@ def main():
     vboxmanage = module.params["vboxmanage"]
     source_image = module.params["source_image"]
     target_image = module.params["target_image"]
+    network_type = module.params["network_type"]
     state = module.params["state"]
 
-    v = VBox(module, vboxmanage, source_image, target_image, state)
+    v = VBox(module, vboxmanage, source_image, target_image, network_type, state)
 
     if state == 'running':
+        msg = 'target instance: ' + target_image + ' running'
         if v.is_running:
-            msg = 'target instance: ' + target_image + ' running'
             module.exit_json(changed=False, msg=msg, ansible_facts=dict(ipaddress=v.ipaddress))
         else:
             v.start_vm()
-            msg = 'target instance: ' + target_image + ' running'
             module.exit_json(changed=True, msg=msg, ansible_facts=dict(ipaddress=v.ipaddress))
     if state == 'absent':
+        msg = 'target instance: ' + target_image + ' deleted'
         if v.target_image in v.get_vms():
             v.delete_vm()
-            msg = 'target instance: ' + target_image + ' deleted'
             module.exit_json(changed=True, msg=msg)
         else:
-            msg = 'target instance: ' + target_image + ' absent'
             module.exit_json(changed=False, msg=msg)
 
 
