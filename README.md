@@ -17,4 +17,4 @@ For the time-being, simply copy fusion_instance.py into (for example) ~/myansibl
 
 TODO
 ----
-* write a VirtualBox module
+* a general code tidy
