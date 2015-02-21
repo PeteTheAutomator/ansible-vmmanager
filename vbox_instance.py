@@ -20,6 +20,11 @@ options:
     description:
       - name for the target VM
     required: true
+  memsize:
+    description:
+      - amount of memory to allocate VM (in MB)
+    required: false
+    default: 512
   network_type:
     description:
       - networking type
@@ -70,11 +75,12 @@ EXAMPLES = '''
 
 
 class VBox():
-    def __init__(self, module, vboxmanage, source_image, target_image, network_type, state):
+    def __init__(self, module, vboxmanage, source_image, target_image, memsize, network_type, state):
         self.module = module
         self.vboxmanage = vboxmanage
         self.source_image = source_image
         self.target_image = target_image
+        self.memsize = memsize
         self.network_type = network_type
         self.state = state
 
@@ -91,7 +97,7 @@ class VBox():
 
     @property
     def is_running(self):
-        p = self.exec_command(self.escape_spaces(self.vboxmanage) + ' list runningvms')
+        p = self.exec_command(self.vboxmanage + ' list runningvms')
         if p.returncode != 0:
             self.module.fail_json(msg='Error determining if target instance is running')
         for stdoutline in p.stdout.readlines():
@@ -104,8 +110,7 @@ class VBox():
         ipregex = re.compile('^Value: (\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\n')
         maxtries = 60
         tries = 0
-        command = self.escape_spaces(self.vboxmanage) + ' guestproperty get ' + \
-                  self.target_image + ' /VirtualBox/GuestInfo/Net/0/V4/IP'
+        command = self.vboxmanage + ' guestproperty get ' + self.target_image + ' /VirtualBox/GuestInfo/Net/0/V4/IP'
         while tries < maxtries:
             p = self.exec_command(command)
             if p.returncode != 0:
@@ -122,7 +127,7 @@ class VBox():
         self.module.fail_json(msg='Timeout exceeded while trying to get VM ip address')
 
     def get_vms(self):
-        p = self.exec_command(self.escape_spaces(self.vboxmanage) + ' list vms')
+        p = self.exec_command(self.vboxmanage + ' list vms')
         if p.returncode != 0:
             self.module.fail_json(msg='Error trying to get VM list')
         vmlist = []
@@ -130,8 +135,8 @@ class VBox():
             vmlist.append(re.search('"(.*)"', stdoutline).groups()[0])
         return vmlist
 
-    def get_snapshots(self):
-        p = self.exec_command(self.escape_spaces(self.vboxmanage) + ' snapshot ' + self.source_image + ' list')
+    def get_snapshots(self, source_image):
+        p = self.exec_command(self.vboxmanage + ' snapshot ' + source_image + ' list')
         snapshotlist = []
         for stdoutline in p.stdout.readlines():
             if stdoutline != 'This machine does not have any snapshots\n':
@@ -140,18 +145,28 @@ class VBox():
         return snapshotlist
 
     # take a snapshot called "ansible-snapshot" if none exists - this is used for linked cloning
-    def snapshot(self):
-        if 'ansible-snapshot' not in [item.keys()[0] for item in self.get_snapshots()]:
-            p = self.exec_command(self.escape_spaces(self.vboxmanage) + ' snapshot ' +
-                                  self.source_image + ' take ansible-snapshot')
+    def snapshot(self, source_image):
+        if 'ansible-snapshot' not in [item.keys()[0] for item in self.get_snapshots(source_image)]:
+            p = self.exec_command(self.vboxmanage + ' snapshot ' + source_image + ' take ansible-snapshot')
             if p.returncode != 0:
                 self.module.fail_json(msg='Error taking snapshot')
 
     def clone_vm(self):
-        if self.source_image not in self.get_vms():
-            return self.module.fail_json(msg='Cannot find source image')
-        self.snapshot()
-        p = self.exec_command(self.vboxmanage + ' clonevm ' + self.source_image +
+        source_image = ''
+        source_candidate_list = []
+        for source_candidate in self.get_vms():
+            if re.match('.*' + self.source_image + '.*', source_candidate):
+                source_candidate_list.append(source_candidate)
+        if len(source_candidate_list) > 1:
+            self.module.fail_json(msg='Error: found more than one candidate for source image pattern: ".*'
+                                      + self.source_image + '.*"')
+        elif len(source_candidate_list) == 0:
+            self.module.fail_json(msg='Error: cannot find a single candidate for source image pattern: ".*'
+                                      + self.source_image + '.*"')
+        else:
+            source_image = source_candidate_list[0]
+        self.snapshot(source_image)
+        p = self.exec_command(self.vboxmanage + ' clonevm ' + source_image +
                               ' --options link --name ' + self.target_image +
                               '  --snapshot ansible-snapshot --register')
         if p.returncode != 0:
@@ -161,33 +176,65 @@ class VBox():
         p = self.exec_command(self.vboxmanage + ' modifyvm ' + self.target_image + ' --nic1 ' + self.network_type)
         if p.returncode != 0:
             self.module.fail_json(msg='Error setting network type')
+        # TODO: implement parameterisation of hostonly interface
         if self.network_type == 'hostonly':
-            p = self.exec_command(self.vboxmanage + ' modifyvm ' + self.target_image + ' --hostonlyadapter1 "vboxnet0"')
+            hostonly_interface_regex = re.compile('^Name:\s+(.+)$')
+            hostonly_interface_list = []
+            p = self.exec_command(self.vboxmanage + ' list hostonlyifs')
             if p.returncode != 0:
-                self.module.fail_json(msg='Error setting bridge adapter')
-        elif self.network_type == 'bridged':
-            p = self.exec_command(self.vboxmanage + ' modifyvm ' + self.target_image + ' --bridgeadapter1 "en0: Wi-Fi (AirPort)"')
+                self.module.fail_json(msg='Error: failed to find hostonly interfaces')
+            for stdoutline in p.stdout.readlines():
+                if hostonly_interface_regex.match(stdoutline):
+                    hostonly_interface_list.append(hostonly_interface_regex.search(stdoutline).groups()[0])
+            if len(hostonly_interface_list) != 1:
+                self.module.fail_json(msg='Error: failed to find exactly 1 matching bridged interface')
+
+            p = self.exec_command(self.vboxmanage + ' modifyvm ' + self.target_image +
+                                  ' --hostonlyadapter1 "' + hostonly_interface_list[0] + '"')
             if p.returncode != 0:
                 self.module.fail_json(msg='Error setting hostonly adapter')
+        # TODO: implement parameterisation of bridged interface (to override non-mac "en0" convention)
+        elif self.network_type == 'bridged':
+            bridged_interface_regex = re.compile('^Name:\s+(en0.+)$')
+            bridged_interface_list = []
+            p = self.exec_command(self.vboxmanage + ' list bridgedifs')
+            if p.returncode != 0:
+                self.module.fail_json(msg='Error: failed to find bridged interfaces')
+            for stdoutline in p.stdout.readlines():
+                if bridged_interface_regex.match(stdoutline):
+                    bridged_interface_list.append(bridged_interface_regex.search(stdoutline).groups()[0])
+            if len(bridged_interface_list) != 1:
+                self.module.fail_json(msg='Error: failed to find exactly 1 matching bridged interface')
+            p = self.exec_command(self.vboxmanage + ' modifyvm ' + self.target_image +
+                                  ' --bridgeadapter1 "' + bridged_interface_list[0] + '"')
+
+            if p.returncode != 0:
+                self.module.fail_json(msg='Error setting bridged adapter')
+
+    def set_memsize(self):
+        p = self.exec_command(self.vboxmanage + ' modifyvm ' + self.target_image + ' --memory ' + self.memsize)
+        if p.returncode != 0:
+            self.module.fail_json(msg='Error: failed to set memory size')
 
     def start_vm(self):
         if self.target_image not in self.get_vms():
             self.clone_vm()
             self.set_network_type()
+            self.set_memsize()
         p = self.exec_command(self.vboxmanage + ' startvm ' + self.target_image + ' --type gui')
         if p.returncode != 0 or self.is_running is False:
             self.module.fail_json(msg='Error trying to start VM')
 
     def stop_vm(self):
         if self.is_running:
-            p = self.exec_command(self.escape_spaces(self.vboxmanage) + ' controlvm ' + self.target_image + ' poweroff')
+            p = self.exec_command(self.vboxmanage + ' controlvm ' + self.target_image + ' poweroff')
             if p.returncode != 0:
                 self.module.fail_json(msg='Failed to power-off VM')
 
     def delete_vm(self):
         if self.is_running:
             self.stop_vm()
-        p = self.exec_command(self.escape_spaces(self.vboxmanage) + ' unregistervm ' + self.target_image + ' --delete')
+        p = self.exec_command(self.vboxmanage + ' unregistervm ' + self.target_image + ' --delete')
         if p.returncode != 0:
             self.module.fail_json(msg='Failed to delete VM')
 
@@ -198,6 +245,7 @@ def main():
             vboxmanage=dict(default='/usr/bin/VBoxManage'),
             source_image=dict(required=True),
             target_image=dict(required=True),
+            memsize=dict(default='512'),
             network_type=dict(default='bridged'),
             state=dict(default='running'),
         )
@@ -206,10 +254,11 @@ def main():
     vboxmanage = module.params["vboxmanage"]
     source_image = module.params["source_image"]
     target_image = module.params["target_image"]
+    memsize = module.params["memsize"]
     network_type = module.params["network_type"]
     state = module.params["state"]
 
-    v = VBox(module, vboxmanage, source_image, target_image, network_type, state)
+    v = VBox(module, vboxmanage, source_image, target_image, memsize, network_type, state)
 
     if state == 'running':
         msg = 'target instance: ' + target_image + ' running'
