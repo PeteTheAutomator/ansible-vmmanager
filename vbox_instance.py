@@ -195,7 +195,7 @@ class VBox():
                 self.module.fail_json(msg='Error setting hostonly adapter')
         # TODO: implement parameterisation of bridged interface (to override non-mac "en0" convention)
         elif self.network_type == 'bridged':
-            bridged_interface_regex = re.compile('^Name:\s+(en0.+)$')
+            bridged_interface_regex = re.compile('^Name:\s+(en0.+|eth.+)$')
             bridged_interface_list = []
             p = self.exec_command(self.vboxmanage + ' list bridgedifs')
             if p.returncode != 0:
