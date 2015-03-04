@@ -53,6 +53,33 @@ options:
 EXAMPLES = '''
 # Create a clone image called web01.localdomain from a source image called base-image-centos6
 - fusion_instance: source_image='base-image-centos6' target_image='web01.localdomain'
+
+# Complete playbook to provision a couple of VMs, set their hostname and install httpd...
+- hosts: localhost
+  connection: local
+  gather_facts: False
+  tasks:
+
+    - name: provision instance
+      fusion_instance: source_image=packer-vmware-base-centos-6.6 target_image={{ item }} memsize=1024
+      register: instance_result
+      with_items:
+        - web01.localdomain
+        - web02.localdomain
+
+    - name: Add instance results to host group
+      add_host: hostname={{ item.ansible_facts.ipaddress }} groupname=fusion_hosts hostname_to_set={{ item.item }}
+      with_items: instance_result.results
+
+- hosts: vbox_hosts
+  remote_user: vagrant
+  sudo: yes
+  pre_tasks:
+    - name: set hostname
+      hostname: name={{ hostname_to_set }}
+  tasks:
+    - name: install httpd
+      yum: name=httpd state=installed
 '''
 
 
