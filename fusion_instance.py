@@ -71,7 +71,7 @@ EXAMPLES = '''
       add_host: hostname={{ item.ansible_facts.ipaddress }} groupname=fusion_hosts hostname_to_set={{ item.item }}
       with_items: instance_result.results
 
-- hosts: vbox_hosts
+- hosts: fusion_hosts
   remote_user: vagrant
   sudo: yes
   pre_tasks:
